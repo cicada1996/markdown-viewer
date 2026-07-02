@@ -1,0 +1,24 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#ece7db"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#paper)"/>
+  <rect x="101" y="101" width="822" height="822" rx="185" fill="none" stroke="#00000014" stroke-width="2"/>
+  <text x="512" y="432" text-anchor="middle"
+        font-family="'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-weight="800" font-size="264" letter-spacing="4"
+        fill="#FA0F00">PDF</text>
+  <path d="M 212 352 C 400 318, 640 340, 818 300"
+        fill="none" stroke="#23272e" stroke-width="54" stroke-linecap="round"/>
+  <g transform="rotate(-4 512 720)">
+    <text x="512" y="800" text-anchor="middle"
+          font-family="'Bradley Hand', 'Marker Felt', cursive"
+          font-weight="700" font-size="380"
+          fill="#2456d6">md</text>
+    <path d="M 330 872 Q 512 920, 700 858"
+          fill="none" stroke="#2456d6" stroke-width="20" stroke-linecap="round"/>
+  </g>
+</svg>
