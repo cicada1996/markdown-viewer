@@ -36,3 +36,5 @@ def hello(name: str) -> str:
 ---
 
 If everything above renders nicely, the viewer is working.
+
+Edit mode works! **Saved from the built-in editor.**

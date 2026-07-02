@@ -1,8 +1,12 @@
-// Markdown Viewer — a minimal read-only .md viewer for macOS.
-// Renders with marked.js inside a WKWebView and live-reloads when the file changes.
+// Markdown Viewer — a minimal .md viewer for macOS.
+// Renders with marked.js inside a WKWebView, live-reloads when the file
+// changes, and offers a plain-text edit mode plus a light/dark toggle.
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+
+static NSString * const kAppearanceKey = @"appearanceOverride";
+static NSString * const kAppearanceChanged = @"MarkdownViewerAppearanceChanged";
 
 static NSString *bundleResource(NSString *name, NSString *ext) {
     NSURL *url = [[NSBundle mainBundle] URLForResource:name withExtension:ext];
@@ -35,14 +39,34 @@ static BOOL isMarkdownURL(NSURL *url) {
     return [@[@"md", @"markdown", @"mdown", @"mkd"] containsObject:ext];
 }
 
+static BOOL appIsDark(void) {
+    NSAppearance *appearance = NSApp.appearance ?: NSApp.effectiveAppearance;
+    NSString *match = [appearance bestMatchFromAppearancesWithNames:
+        @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+    return [match isEqualToString:NSAppearanceNameDarkAqua];
+}
+
+static NSButton *titlebarButton(NSString *symbol, NSString *tooltip, id target, SEL action) {
+    NSImage *image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:tooltip];
+    NSButton *button = [NSButton buttonWithImage:image target:target action:action];
+    button.bezelStyle = NSBezelStyleTexturedRounded;
+    button.toolTip = tooltip;
+    return button;
+}
+
 #pragma mark - Viewer window
 
 @class AppDelegate;
 
-@interface ViewerController : NSObject <NSWindowDelegate, WKNavigationDelegate>
+@interface ViewerController : NSObject <NSWindowDelegate, WKNavigationDelegate, NSTextViewDelegate>
 @property (nonatomic, strong) NSURL *fileURL;
 @property (nonatomic, strong) NSWindow *window;
 @property (nonatomic, strong) WKWebView *webView;
+@property (nonatomic, strong) NSScrollView *editorScroll;
+@property (nonatomic, strong) NSTextView *textView;
+@property (nonatomic, strong) NSButton *editButton;
+@property (nonatomic, strong) NSButton *appearanceButton;
+@property (nonatomic, assign) BOOL editing;
 @property (nonatomic, strong) dispatch_source_t monitor;
 @property (nonatomic, assign) double pendingScrollY;
 @property (nonatomic, copy) void (^onClose)(void);
@@ -76,14 +100,48 @@ static BOOL isMarkdownURL(NSURL *url) {
     _window.title = fileURL.lastPathComponent;
     _window.subtitle = [fileURL.URLByDeletingLastPathComponent.path
         stringByReplacingOccurrencesOfString:NSHomeDirectory() withString:@"~"];
+    _window.representedURL = fileURL;
     _window.delegate = self;
     _window.tabbingMode = NSWindowTabbingModePreferred;
     [_window setFrameAutosaveName:@"MarkdownViewerWindow"];
+
+    [self setupTitlebarButtons];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(refreshAppearanceIcon)
+                                                 name:kAppearanceChanged
+                                               object:nil];
 
     [self render];
     [self startWatching];
     [[NSDocumentController sharedDocumentController] noteNewRecentDocumentURL:fileURL];
     return self;
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)setupTitlebarButtons {
+    _editButton = titlebarButton(@"pencil", @"Edit (⌘E)", self, @selector(toggleEdit:));
+    _appearanceButton = titlebarButton(appIsDark() ? @"sun.max" : @"moon",
+                                       @"Light/dark mode (⇧⌘D)", self, @selector(toggleAppearance:));
+    // Titlebar accessories are frame-based — lay the buttons out manually.
+    _editButton.frame = NSMakeRect(0, 0, 36, 22);
+    _appearanceButton.frame = NSMakeRect(40, 0, 36, 22);
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 84, 22)];
+    [container addSubview:_editButton];
+    [container addSubview:_appearanceButton];
+    NSTitlebarAccessoryViewController *accessory = [NSTitlebarAccessoryViewController new];
+    accessory.view = container;
+    accessory.layoutAttribute = NSLayoutAttributeTrailing;
+    [_window addTitlebarAccessoryViewController:accessory];
+}
+
+#pragma mark Rendering
+
+- (NSString *)fileContents {
+    return [NSString stringWithContentsOfURL:self.fileURL encoding:NSUTF8StringEncoding error:NULL];
 }
 
 - (void)render {
@@ -92,9 +150,7 @@ static BOOL isMarkdownURL(NSURL *url) {
         ViewerController *strongSelf = weakSelf;
         if (!strongSelf) return;
         strongSelf.pendingScrollY = [value isKindOfClass:[NSNumber class]] ? [value doubleValue] : 0;
-        NSString *markdown = [NSString stringWithContentsOfURL:strongSelf.fileURL
-                                                      encoding:NSUTF8StringEncoding
-                                                         error:NULL];
+        NSString *markdown = [strongSelf fileContents];
         if (!markdown) markdown = [NSString stringWithFormat:@"*Could not read %@*", strongSelf.fileURL.path];
         [strongSelf.webView loadHTMLString:htmlPage(markdown)
                                    baseURL:strongSelf.fileURL.URLByDeletingLastPathComponent];
@@ -124,6 +180,109 @@ static BOOL isMarkdownURL(NSURL *url) {
         [[NSWorkspace sharedWorkspace] openURL:url];
     }
 }
+
+#pragma mark Edit mode
+
+- (void)setupEditor {
+    NSRect frame = ((NSView *)self.window.contentView).frame;
+    _editorScroll = [[NSScrollView alloc] initWithFrame:frame];
+    _editorScroll.hasVerticalScroller = YES;
+    NSSize contentSize = _editorScroll.contentSize;
+
+    _textView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, contentSize.width, contentSize.height)];
+    _textView.richText = NO;
+    _textView.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+    _textView.allowsUndo = YES;
+    _textView.textContainerInset = NSMakeSize(24, 24);
+    _textView.textColor = NSColor.textColor;
+    _textView.backgroundColor = NSColor.textBackgroundColor;
+    // Smart substitutions mangle Markdown and code — plain text only.
+    _textView.automaticQuoteSubstitutionEnabled = NO;
+    _textView.automaticDashSubstitutionEnabled = NO;
+    _textView.automaticTextReplacementEnabled = NO;
+    _textView.automaticSpellingCorrectionEnabled = NO;
+    _textView.minSize = NSMakeSize(0, contentSize.height);
+    _textView.maxSize = NSMakeSize(FLT_MAX, FLT_MAX);
+    _textView.verticallyResizable = YES;
+    _textView.horizontallyResizable = NO;
+    _textView.autoresizingMask = NSViewWidthSizable;
+    _textView.textContainer.containerSize = NSMakeSize(contentSize.width, FLT_MAX);
+    _textView.textContainer.widthTracksTextView = YES;
+    _textView.delegate = self;
+
+    _editorScroll.documentView = _textView;
+}
+
+- (void)toggleEdit:(id)sender {
+    if (self.editing) {
+        if (self.window.documentEdited) [self saveDocument:nil];
+        self.editing = NO;
+        self.window.contentView = self.webView;
+        self.editButton.image = [NSImage imageWithSystemSymbolName:@"pencil"
+                                          accessibilityDescription:@"Edit"];
+        self.editButton.toolTip = @"Edit (⌘E)";
+        [self render];
+    } else {
+        if (!self.textView) [self setupEditor];
+        [self.textView setString:[self fileContents] ?: @""];
+        [self.textView.undoManager removeAllActions];
+        self.window.documentEdited = NO;
+        self.editing = YES;
+        self.window.contentView = self.editorScroll;
+        [self.window makeFirstResponder:self.textView];
+        self.editButton.image = [NSImage imageWithSystemSymbolName:@"doc.richtext"
+                                          accessibilityDescription:@"Preview"];
+        self.editButton.toolTip = @"Preview (⌘E)";
+    }
+}
+
+- (void)saveDocument:(id)sender {
+    if (!self.editing) return;
+    NSError *error;
+    if ([self.textView.string writeToURL:self.fileURL atomically:YES
+                                encoding:NSUTF8StringEncoding error:&error]) {
+        self.window.documentEdited = NO;
+    } else {
+        NSAlert *alert = [NSAlert alertWithError:error];
+        [alert beginSheetModalForWindow:self.window completionHandler:nil];
+    }
+}
+
+- (void)textDidChange:(NSNotification *)notification {
+    self.window.documentEdited = YES;
+}
+
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    if (!(self.editing && self.window.documentEdited)) return YES;
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = [NSString stringWithFormat:@"Save changes to %@?", self.fileURL.lastPathComponent];
+    [alert addButtonWithTitle:@"Save"];
+    [alert addButtonWithTitle:@"Cancel"];
+    [alert addButtonWithTitle:@"Don't Save"];
+    NSModalResponse response = [alert runModal];
+    if (response == NSAlertFirstButtonReturn) {
+        [self saveDocument:nil];
+        return YES;
+    }
+    return response == NSAlertThirdButtonReturn;
+}
+
+#pragma mark Appearance
+
+- (void)toggleAppearance:(id)sender {
+    NSString *next = appIsDark() ? NSAppearanceNameAqua : NSAppearanceNameDarkAqua;
+    NSApp.appearance = [NSAppearance appearanceNamed:next];
+    [[NSUserDefaults standardUserDefaults] setObject:next forKey:kAppearanceKey];
+    [[NSNotificationCenter defaultCenter] postNotificationName:kAppearanceChanged object:nil];
+}
+
+- (void)refreshAppearanceIcon {
+    NSString *symbol = appIsDark() ? @"sun.max" : @"moon";
+    self.appearanceButton.image = [NSImage imageWithSystemSymbolName:symbol
+                                            accessibilityDescription:@"Light/dark mode"];
+}
+
+#pragma mark File watching
 
 // Re-render whenever the file changes; editors often replace the file
 // atomically (rename), so re-arm the watcher on rename/delete.
@@ -238,16 +397,29 @@ static NSMenu *buildMenu(void) {
 
     NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
     [fileMenu addItemWithTitle:@"Open…" action:@selector(openDocument:) keyEquivalent:@"o"];
+    [fileMenu addItemWithTitle:@"Save" action:@selector(saveDocument:) keyEquivalent:@"s"];
     [fileMenu addItemWithTitle:@"Close" action:@selector(performClose:) keyEquivalent:@"w"];
     [main addItemWithTitle:@"File" action:nil keyEquivalent:@""].submenu = fileMenu;
 
     NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [editMenu addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
+    NSMenuItem *redo = [editMenu addItemWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"Z"];
+    redo.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
     [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+    [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
     [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+    [editMenu addItem:[NSMenuItem separatorItem]];
     [editMenu addItemWithTitle:@"Find…" action:@selector(performTextFinderAction:) keyEquivalent:@"f"];
     [main addItemWithTitle:@"Edit" action:nil keyEquivalent:@""].submenu = editMenu;
 
     NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+    [viewMenu addItemWithTitle:@"Toggle Editing" action:@selector(toggleEdit:) keyEquivalent:@"e"];
+    NSMenuItem *dark = [viewMenu addItemWithTitle:@"Toggle Light/Dark Mode"
+                                           action:@selector(toggleAppearance:) keyEquivalent:@"D"];
+    dark.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItemWithTitle:@"Reload" action:@selector(reload:) keyEquivalent:@"r"];
     [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItemWithTitle:@"Actual Size" action:@selector(actualSize:) keyEquivalent:@"0"];
@@ -268,6 +440,8 @@ static NSMenu *buildMenu(void) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
+        NSString *savedAppearance = [[NSUserDefaults standardUserDefaults] stringForKey:kAppearanceKey];
+        if (savedAppearance) app.appearance = [NSAppearance appearanceNamed:savedAppearance];
         static AppDelegate *delegate;
         delegate = [AppDelegate new];
         app.delegate = delegate;
