@@ -96,6 +96,10 @@ static NSButton *titlebarButton(NSString *symbol, NSString *tooltip, id target, 
                             NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                     backing:NSBackingStoreBuffered
                       defer:NO];
+    // We hold the window in a strong property, so ARC owns it. Left at the
+    // default (YES), closing the window makes AppKit release it too — a
+    // double-free that later crashes while AppKit tears down its window list.
+    _window.releasedWhenClosed = NO;
     _window.contentView = _webView;
     _window.title = fileURL.lastPathComponent;
     _window.subtitle = [fileURL.URLByDeletingLastPathComponent.path
@@ -362,8 +366,14 @@ static NSButton *titlebarButton(NSString *symbol, NSString *tooltip, id target, 
     __weak AppDelegate *weakSelf = self;
     __weak ViewerController *weakViewer = viewer;
     viewer.onClose = ^{
-        AppDelegate *strongSelf = weakSelf;
-        if (strongSelf && weakViewer) [strongSelf->_viewers removeObject:weakViewer];
+        // Defer removal to the next runloop turn. Removing the viewer here
+        // drops the last strong reference and would dealloc the window while
+        // AppKit is still mid-close and holds it in the autorelease pool —
+        // draining that pool would then over-release the freed window (crash).
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AppDelegate *strongSelf = weakSelf;
+            if (strongSelf && weakViewer) [strongSelf->_viewers removeObject:weakViewer];
+        });
     };
     [_viewers addObject:viewer];
     [viewer.window makeKeyAndOrderFront:nil];
